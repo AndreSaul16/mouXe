@@ -30,7 +30,7 @@ MODEL_FILE = "models/gesture_model.h5"
 LABELS_FILE = "models/gesture_labels.pkl"
 
 BUFFER_SIZE = 30    # Frames por sample (debe coincidir con recolector)
-NUM_FEATURES = 63   # 21 landmarks * 3 coordenadas
+NUM_FEATURES = 126   # 21 landmarks * 3 coordenadas * 2 manos
 NUM_CLASSES = 11    # MOVE, LEFT_CLICK, RIGHT_CLICK, SCROLL, FORWARD, BACK, PUPPET, FIST, PALM, ZOOM_IN, ZOOM_OUT
 
 EPOCHS = 50
@@ -40,14 +40,14 @@ BATCH_SIZE = 32
 # ARQUITECTURA DEL MODELO
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def create_model(num_classes=NUM_CLASSES):
+def create_model(num_classes=NUM_CLASSES, input_shape=(BUFFER_SIZE, NUM_FEATURES)):
     """
     Crea el modelo BiLSTM.
     Arquitectura basada en el paper original.
     """
     model = Sequential([
         # Input
-        tf.keras.layers.Input(shape=(BUFFER_SIZE, NUM_FEATURES)),
+        tf.keras.layers.Input(shape=input_shape),
         
         # BiLSTM Layer 1
         Bidirectional(LSTM(128, return_sequences=True, activation='sigmoid')),
@@ -139,25 +139,37 @@ def main():
     max_len = max(len(x) for x in X)
     print(f"  Longitud secuencias: min={min_len}, max={max_len}")
     
-    # Padding todas las secuencias a la misma longitud (max)
-    X_padded = []
-    for seq in X:
-        if len(seq) < max_len:
-            # Relleno con ceros al final
-            padded = np.vstack([seq, np.zeros((max_len - len(seq), NUM_FEATURES), dtype=np.float32)])
-            X_padded.append(padded)
-        else:
-            X_padded.append(seq[:max_len])
+    # Detectar dimensión máxima de features (63 o 126)
+    max_features = max(np.array(s).shape[1] for g in data for s in data[g] if len(s) > 0)
+    print(f"  Dimensión de features detectada: {max_features}")
     
-    X = np.array(X_padded, dtype=np.float32)
-    print(f"  X shape (padded): {X.shape}")
+    # Padding todas las secuencias a la misma longitud y dimensión de features
+    X_fixed = []
+    for seq in X:
+        seq = np.array(seq, dtype=np.float32)
+        # 1. Ajustar features (de 63 a max_features)
+        if seq.shape[1] < max_features:
+            padding_features = np.zeros((seq.shape[0], max_features - seq.shape[1]), dtype=np.float32)
+            seq = np.hstack([seq, padding_features])
+        
+        # 2. Ajustar longitud temporal (max_len)
+        if len(seq) < max_len:
+            padding_time = np.zeros((max_len - len(seq), max_features), dtype=np.float32)
+            seq = np.vstack([seq, padding_time])
+        else:
+            seq = seq[:max_len]
+            
+        X_fixed.append(seq)
+    
+    X = np.array(X_fixed, dtype=np.float32)
+    print(f"  X shape final: {X.shape}")
     
     # Convertir labels a one-hot
     y_hot = tf.keras.utils.to_categorical(y, num_classes=len(labels))
     
     # Crear modelo
     print("Creando modelo BiLSTM...")
-    model = create_model(num_classes=len(labels))
+    model = create_model(num_classes=len(labels), input_shape=(X.shape[1], X.shape[2]))
     model.summary()
     print()
     

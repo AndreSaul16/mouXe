@@ -16,10 +16,13 @@ MouXe - Control tu ordenador con una sola mano
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 import pyautogui
 import math
 import time
 import ctypes
+import os
 
 # Zoom estilo Iron Man: abrir/cerrar mano para zoom en pantalla
 # Los gestos IronMan se detectan comparando la apertura de la mano completa
@@ -60,16 +63,25 @@ ZONE_Y_MIN        = 0.10
 ZONE_Y_MAX        = 0.75
 MIRROR            = True      # espejo horizontal
 MOSTRAR_CAMARA    = True      # mostrar ventana de debug
+
+# Ruta al modelo de MediaPipe
+MODEL_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 # ──────────────────────────────────────────────────────────────────────────────
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE    = 0
 
-mp_hands   = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_styles  = mp.solutions.drawing_styles
-
 SCREEN_W, SCREEN_H = pyautogui.size()
+
+# ─── Conexiones de la mano para dibujo (reemplaza mp_hands.HAND_CONNECTIONS) ─
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),       # Pulgar
+    (0, 5), (5, 6), (6, 7), (7, 8),       # Índice
+    (5, 9), (9, 10), (10, 11), (11, 12),  # Corazón
+    (9, 13), (13, 14), (14, 15), (15, 16),# Anular
+    (13, 17), (17, 18), (18, 19), (19, 20),# Meñique
+    (0, 17),                                # Palma
+]
 
 # Índices de landmarks
 PULGAR_TIP  = 4;  PULGAR_IP   = 3
@@ -494,6 +506,21 @@ def render_hud(frame, estado):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.72, col, 2)
 
 
+def draw_hand_landmarks(frame, landmarks, fw, fh):
+    """Dibuja landmarks y conexiones de la mano en el frame (reemplaza mp_drawing)."""
+    points = []
+    for lm in landmarks:
+        px = int(lm.x * fw)
+        py = int(lm.y * fh)
+        points.append((px, py))
+        cv2.circle(frame, (px, py), 4, (0, 255, 0), -1)
+        cv2.circle(frame, (px, py), 5, (0, 0, 0), 1)
+
+    for start, end in HAND_CONNECTIONS:
+        if start < len(points) and end < len(points):
+            cv2.line(frame, points[start], points[end], (0, 200, 0), 2)
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -502,14 +529,19 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    with mp_hands.Hands(
-        model_complexity=1,
-        max_num_hands=1,
-        min_detection_confidence=0.55,
+    # Configurar HandLandmarker con la nueva API mp.tasks
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.55,
         min_tracking_confidence=0.45,
-    ) as hands:
+    )
 
+    with mp_vision.HandLandmarker.create_from_options(options) as landmarker:
         print("MouXe activo — presiona Q en la ventana para salir")
+        frame_timestamp_ms = 0
 
         while cap.isOpened():
             ok, frame = cap.read()
@@ -521,23 +553,20 @@ def main():
 
             fh, fw = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            result = hands.process(rgb)
-            rgb.flags.writeable = True
+
+            # Crear mp.Image y detectar
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+            frame_timestamp_ms += 33  # ~30 fps
 
             estado = "INACTIVA"
 
-            if result.multi_hand_landmarks:
-                lm_obj = result.multi_hand_landmarks[0]
-                estado = mouxe.procesar(lm_obj.landmark, fw, fh)
+            if result.hand_landmarks:
+                lm = result.hand_landmarks[0]  # lista de NormalizedLandmark
+                estado = mouxe.procesar(lm, fw, fh)
 
                 if MOSTRAR_CAMARA:
-                    mp_drawing.draw_landmarks(
-                        frame, lm_obj,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_styles.get_default_hand_landmarks_style(),
-                        mp_styles.get_default_hand_connections_style(),
-                    )
+                    draw_hand_landmarks(frame, lm, fw, fh)
             else:
                 mouxe.reset()
 
