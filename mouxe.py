@@ -21,6 +21,18 @@ import math
 import time
 import ctypes
 
+# Zoom estilo Iron Man: abrir/cerrar mano para zoom en pantalla
+# Los gestos IronMan se detectan comparando la apertura de la mano completa
+
+# ═══ MOUXE ML - Módulo de ML (opcional) ═══════════════════════════════════
+try:
+    from mouxe_ml import GestureBuffer, GestureClassifier, BUFFER_SIZE
+    USE_ML = True
+except ImportError:
+    USE_ML = False
+    print("⚠ mouxe_ml no disponible, usando lógica clásica")
+# ══════════════════════════════════════════════════════════════════════════════
+
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 CAMARA            = 0         # 0 = webcam principal
 NUM_PANTALLAS     = 2         # 1 = un monitor, 2 = doble pantalla (ajusta ganancia)
@@ -32,6 +44,14 @@ FINGER_UP_MARGIN  = 0.01      # margen para considerar dedo "levantado"
 BOUNCE_COOLDOWN   = 0.08      # segundos mínimos entre mouseDown (anti-rebote)
 SCROLL_SPEED      = 10        # velocidad de scroll
 HOLD_VISUAL_TIME  = 0.5       # segundos para mostrar indicador [HOLD] en HUD
+
+# ─── GESTOS IRONMAN (Zoom estilo HUD) ────────────────────────────────────────
+# Estos gestos simulan el interfaz de Iron Man: abrir/cerrar puño para zoom
+IRONMAN_ENABLED   = True      # Activar gestos IronMan
+IRONMAN_ZOOM_IN    = 0.75      # Ratio de apertura para zoom in (puño cerrado → abierto)
+IRONMAN_ZOOM_OUT   = 0.45      # Ratio de apertura para zoom out (abierta → puño)
+IRONMAN_SENSITIVITY = 0.08    # Sensibilidad del zoom
+
 # Zonas activas de la cámara — se ajustan automáticamente por NUM_PANTALLAS
 # Con más pantallas las zonas se estrechan → más ganancia → menos movimiento necesario
 ZONE_X_MIN        = 0.50 - 0.35 / NUM_PANTALLAS   # 1 pantalla: 0.15  |  2 pantallas: 0.325
@@ -73,6 +93,28 @@ def dist_norm(p1, p2):
 
 def finger_up(lm, tip, pip):
     return lm[tip].y < lm[pip].y + FINGER_UP_MARGIN
+
+
+def hand_open_ratio(lm, hs):
+    """
+    Calcula el ratio de apertura de la mano (0 = puño cerrado, 1 = mano abierta).
+    Estilo IronMan: compara la distancia entre dedos opuestos.
+    """
+    # Distancia entre pulgar e índice (diagonal de la mano)
+    thumb_index = dist_norm(lm[PULGAR_TIP], lm[INDICE_TIP]) / hs
+    
+    # Distancia entre pulgar y meñique (ancho de la mano abierta)
+    thumb_pinky = dist_norm(lm[PULGAR_TIP], lm[MENIQUE_TIP]) / hs
+    
+    # Distancia entre índice y meñique (apertura horizontal)
+    index_pinky = dist_norm(lm[INDICE_TIP], lm[MENIQUE_TIP]) / hs
+    
+    # Combinar en un ratio de apertura normalizado
+    # Valores típicos: puño cerrado ~0.2-0.3, mano abierta ~0.8-1.0
+    ratio = (thumb_index + thumb_pinky + index_pinky) / 3.0
+    
+    # Normalizar al rango [0, 1]
+    return min(1.0, max(0.0, ratio * 1.2))
 
 
 def lerp(a, b, t):
@@ -161,6 +203,30 @@ class MouXe:
         self.scroll_ref  = None
         self.scroll_mode = False
 
+        # ─── IRONMAN ZOOM STATE ────────────────────────────────────────────────
+        self.ironman_open_ratio = None  # Ratio de apertura de la mano
+        self.ironman_zoom_level = 0     # Nivel de zoom acumulado
+        self.ironman_last_action = None  # última acción (zoom_in/zoom_out/none)
+
+        # ─── ML INTEGRATION ───────────────────────────────────────────────
+        self.use_ml = USE_ML
+        if self.use_ml:
+            try:
+                self.ml_buffer = GestureBuffer()
+                self.classifier = GestureClassifier()
+                self.ml_enabled = self.classifier.is_loaded
+                if self.ml_enabled:
+                    print("✓ ML Activado: BiLSTM disponível para reconocimiento de gestos")
+                else:
+                    print("⚠ ML disponible pero sin modelo entrenado - usando fallback clásico")
+            except Exception as e:
+                print(f"✗ Error inicializando ML: {e}")
+                self.use_ml = False
+                self.ml_enabled = False
+        else:
+            self.ml_enabled = False
+        # ──────────────────────────────────────────────────────────────────
+
     def _hyst(self, key, ratio):
         """Histéresis: umbral bajo para activar, alto para soltar."""
         if self._pinch[key]:
@@ -181,8 +247,61 @@ class MouXe:
         self.cy = lerp(self.cy, ty, SUAVIZADO)
         pyautogui.moveTo(int(self.cx), int(self.cy))
 
+    # ═══ ML INTEGRATION ═════════════════════════════════════════════════════
+    # Mapeo de gestos ML a acciones de MouXe
+    ML_GESTO_A_ACCION = {
+        'MOVE': 'move',
+        'LEFT_CLICK': 'left_click',
+        'RIGHT_CLICK': 'right_click',
+        'SCROLL': 'scroll',
+        'FORWARD': 'forward',
+        'BACK': 'back',
+        'PUPPET': 'puppet',
+        'FIST': 'left_click',  # Puño = click + drag
+        'PALM': None,           # Palma = inactivo
+        'V_GEST': 'move',
+    }
+    
+    def _procesar_ml(self, lm, w, h):
+        """
+        Procesa usando el clasificador ML (BiLSTM).
+        Retorna (gesto, confidence, siguiente, sig_confianza) o (None, 0, None, 0) si no se puede predecir.
+        """
+        if not self.ml_enabled:
+            return None, 0.0, None, 0.0
+        
+        # Añadir frame al buffer
+        self.ml_buffer.add_frame(lm)
+        
+        # Solo predecir si el buffer está lleno
+        if not self.ml_buffer.is_full:
+            return None, 0.0, None, 0.0
+        
+        # Obtener secuencia y predecir
+        sequence = self.ml_buffer.get_sequence()
+        gesto_ml, confianza, siguiente, sig_confianza = self.classifier.predict(sequence)
+        
+        if gesto_ml is not None:
+            # Mapear gesto ML a acción de MouXe
+            accion = self.ML_GESTO_A_ACCION.get(gesto_ml)
+            return accion, confianza, siguiente, sig_confianza
+        
+        return None, confianza, siguiente, sig_confianza
+    # ═══════════════════════════════════════════════════════════════════════
+
     def procesar(self, lm, w, h):
         hs = hand_size(lm) or 0.001
+
+        # ═══ USAR SIEMPRE ML ═════════════════════════════════════
+        # Si el modelo ML está disponible y entrenado, usarlo
+        ml_gesto = None
+        ml_confidence = 0.0
+        ml_siguiente = None
+        ml_sig_conf = 0.0
+        
+        if self.ml_enabled:
+            ml_gesto, ml_confidence, ml_siguiente, ml_sig_conf = self._procesar_ml(lm, w, h)
+        # ════════════════════════════════════════════════════════════════════
 
         # ── Ratios de pellizco (normalizados por tamaño de mano) ──
         r_pi = dist_norm(lm[PULGAR_TIP], lm[INDICE_TIP])  / hs
@@ -204,7 +323,40 @@ class MouXe:
         min_ratio = min(r_pi, r_pm, r_pa, r_pk)
         approaching = min_ratio < FREEZE_RATIO
 
-        # ── Determinar gesto activo ──
+        # ═══ GESTOS IRONMAN (Zoom estilo HUD) ════════════════════════════════════
+        # Detectar apertura de mano para zoom estilo Iron Man
+        # Solo activa si no hay otros gestos activos y IRONMAN_ENABLED
+        if IRONMAN_ENABLED and not (pinch_pi or pinch_pm or pinch_pa or pinch_pk or i_up or m_up):
+            open_ratio = hand_open_ratio(lm, hs)
+            
+            # Detectar cambio de estado: puño cerrado -> mano abierta = zoom in
+            #                           mano abierta -> puño cerrado = zoom out
+            if self.ironman_open_ratio is not None:
+                delta = open_ratio - self.ironman_open_ratio
+                
+                # Zoom in: mano se abre (delta > threshold)
+                if delta > IRONMAN_SENSITIVITY and self.ironman_last_action != 'zoom_in':
+                    pyautogui.hotkey('ctrl', 'plus')
+                    self.ironman_last_action = 'zoom_in'
+                    self.ironman_zoom_level += 1
+                
+                # Zoom out: mano se cierra (delta < -threshold)
+                elif delta < -IRONMAN_SENSITIVITY and self.ironman_last_action != 'zoom_out':
+                    pyautogui.hotkey('ctrl', 'minus')
+                    self.ironman_last_action = 'zoom_out'
+                    self.ironman_zoom_level -= 1
+                
+                # Reset si vuelve a posición neutral
+                elif abs(delta) < IRONMAN_SENSITIVITY / 2:
+                    self.ironman_last_action = None
+            
+            self.ironman_open_ratio = open_ratio
+        else:
+            self.ironman_open_ratio = None
+            self.ironman_last_action = None
+        # ═══════════════════════════════════════════════════════════════════════
+
+        # ── Determinar gesto activo (LÓGICA CLÁSICA) ──
         puppet = pinch_pi and pinch_pm and pinch_pa and pinch_pk
         gesture = None
 
@@ -222,6 +374,14 @@ class MouXe:
             gesture = 'scroll'
         elif i_up:
             gesture = 'move'
+
+        # ═══ USAR ML SI ESTÁ DISPONIBLE Y CONFIDENCE SUFICIENTE ════════════
+        # Threshold de confianza ML - SIEMPRE usar ML cuando hay predicción
+        ML_CONFIDENCE_THRESHOLD = 0.01  # 1% - siempre usar ML cuando predice algo
+        
+        if ml_gesto is not None and ml_confidence >= ML_CONFIDENCE_THRESHOLD:
+            gesture = ml_gesto
+        # ════════════════════════════════════════════════════════════════════
 
         # ── Actualizar TODOS los botones según gesto activo ──
         self.btn_mid.update(gesture == 'puppet')
@@ -282,6 +442,15 @@ class MouXe:
         self.scroll_ref  = None
         for k in self._pinch:
             self._pinch[k] = False
+        
+        # Limpiar buffer ML
+        if hasattr(self, 'ml_buffer'):
+            self.ml_buffer.reset()
+        
+        # Limpiar estados IronMan
+        self.ironman_open_ratio = None
+        self.ironman_zoom_level = 0
+        self.ironman_last_action = None
 
     def liberar_todo(self):
         """Soltar todos los botones que estén pulsados."""
@@ -303,6 +472,8 @@ COLORES = {
     "SCROLL":       (200,  50, 255),
     "AVANZAR":      (100, 255, 100),
     "RETROCEDER":   (100, 100, 255),
+    "ZOOM IN":      (255, 200,   0),
+    "ZOOM OUT":     (255, 150,   0),
 }
 
 

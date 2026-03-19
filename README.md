@@ -6,6 +6,43 @@ MouXe usa **MediaPipe** para detectar la mano en tiempo real y traduce gestos na
 
 ---
 
+## Versión ML (Beta)
+
+Ahora MouXe incluye un módulo de **aprendizaje automático** opcional que usa **BiLSTM** para un reconocimiento de gestos más robusto.
+
+### Características del módulo ML:
+- **Buffer temporal**: Analiza los últimos 30 frames para contexto temporal
+- **BiLSTM**: Red neuronal bidireccional para clasificación de gestos
+- **Fallback automático**: Si no hay modelo entrenado, usa la lógica clásica
+- **Threshold de confianza**: Solo usa predicción ML si confidence >= 90%
+
+### Cómo usar ML:
+1. Instalar dependencias: `pip install -r requirements.txt`
+2. Entrenar el modelo (ver sección de entrenamiento)
+3. MouXe automáticamente usará ML si el modelo está disponible
+
+### Entrenamiento de nuevos gestos:
+```python
+from mouxe_ml import GestureRecorder, train_model, GestureClassifier
+import numpy as np
+
+# Grabar samples para cada gesto
+recorder = GestureRecorder("MI_GESTO", num_samples=100)
+# ... grabar con la cámara ...
+
+# Entrenar modelo
+X = np.array([...])  # Todos los samples
+y = np.array([...])  # Labels (0-9)
+model = train_model(X, y)
+
+# Guardar modelo
+classifier = GestureClassifier()
+classifier.model = model
+classifier.save_model()
+```
+
+---
+
 ## Controles
 
 Funciona igual con mano izquierda o derecha.

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "engram": {
+      "type": "stdio",
+      "command": "C:/Users/WarMachine/engram/engram.exe",
+      "args": ["mcp", "--tools=agent"],
+      "env": {
+        "ENGRAM_DATA_DIR": "C:/Users/WarMachine/Documents/PROYECTOS/.memoria_ai/Mouxe"
+      }
+    }
+  }
+}
